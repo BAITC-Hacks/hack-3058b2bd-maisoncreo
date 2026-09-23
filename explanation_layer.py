@@ -10,20 +10,18 @@ from urllib import request
 DEFAULT_MODEL = "gpt-5.4-mini"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 
-GENERIC_PHRASES = (
-    "excellent choice",
-    "great choice",
-    "perfect choice",
-    "отличный выбор",
-    "идеальный выбор",
-    "идеально подойдет",
-    "идеально подойдёт",
+STRUCTURED_FIELD_ORDER = (
+    "category",
+    "city",
+    "event_format",
+    "price_from_kzt",
+    "language",
+    "max_hours",
 )
 
 OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
-        "explanation": {"type": "string"},
         "description_evidence": {
             "type": "string",
             "description": (
@@ -36,19 +34,11 @@ OUTPUT_SCHEMA = {
             "type": "array",
             "items": {
                 "type": "string",
-                "enum": [
-                    "category",
-                    "city",
-                    "event_format",
-                    "price_from_kzt",
-                    "language",
-                    "max_hours",
-                ],
+                "enum": list(STRUCTURED_FIELD_ORDER),
             },
         },
     },
     "required": [
-        "explanation",
         "description_evidence",
         "structured_evidence",
     ],
@@ -75,17 +65,19 @@ def enrich_recommendations(result, records, query, *, provider=None):
     if provider is None and os.getenv("OPENAI_API_KEY"):
         provider = openai_explanation
 
+    provider_available = provider is not None
     for card in enriched.get("recommendations", []):
         contractor = records_by_id.get(str(card["id"]))
         if contractor is None:
             continue
 
         generated = None
-        if provider is not None:
+        if provider_available:
             try:
                 generated = validate_explanation(provider(contractor, query), contractor, query)
             except Exception:
                 generated = None
+                provider_available = False
 
         if generated is None:
             generated = fallback_explanation(contractor, query)
@@ -139,19 +131,14 @@ def openai_explanation(contractor, query):
             {
                 "role": "system",
                 "content": (
-                    "Write a concise Russian contractor explanation in 1-2 sentences. "
-                    "Use only the supplied verified fields and description. Start with "
-                    "anon_name and never use another person or company name as the "
-                    "contractor name. Mention at least one verified structured match. "
+                    "Select evidence for a concise Russian contractor explanation. "
+                    "Return at least one structured_evidence field that matches the "
+                    "verified request and contractor data. "
                     "Copy description_evidence verbatim from contractor.description: it "
                     "must be an exact source substring. Do not add quotation marks, "
                     "punctuation, prefixes, suffixes, ellipses, normalization, "
-                    "paraphrasing, or formatting to description_evidence. The explanation "
-                    "may use natural Russian normally, but must include the exact "
-                    "description_evidence substring. Never discuss "
-                    "availability, ratings, reviews, capacity, or experience unless stated "
-                    "verbatim in the evidence excerpt. If mentioning price, call it a "
-                    "starting price using «от» or «стартовая цена». Avoid generic praise."
+                    "paraphrasing, or formatting to description_evidence. Do not write "
+                    "the final explanation; the application constructs it deterministically."
                 ),
             },
             {"role": "user", "content": json.dumps(safe_input, ensure_ascii=False)},
@@ -175,7 +162,7 @@ def openai_explanation(contractor, query):
         },
         method="POST",
     )
-    with request.urlopen(http_request, timeout=20) as response:
+    with request.urlopen(http_request, timeout=6) as response:
         api_response = json.loads(response.read().decode("utf-8"))
     return json.loads(_extract_output_text(api_response))
 
@@ -183,64 +170,54 @@ def openai_explanation(contractor, query):
 def validate_explanation(output, contractor, query):
     """Return validated model output or raise ``ExplanationValidationError``."""
     if not isinstance(output, dict) or set(output) != {
-        "explanation",
         "description_evidence",
         "structured_evidence",
     }:
         raise ExplanationValidationError("Unexpected explanation shape")
 
-    explanation = output["explanation"]
     description_evidence = output["description_evidence"]
     structured_evidence = output["structured_evidence"]
-    if not all(isinstance(value, str) and value.strip() for value in (explanation, description_evidence)):
-        raise ExplanationValidationError("Explanation and evidence must be non-empty strings")
+    if not isinstance(description_evidence, str) or not description_evidence.strip():
+        raise ExplanationValidationError("Description evidence must be a non-empty string")
     if not isinstance(structured_evidence, list) or not structured_evidence:
         raise ExplanationValidationError("At least one structured evidence field is required")
-    if len(explanation) > 600 or not 1 <= _sentence_count(explanation) <= 2:
-        raise ExplanationValidationError("Explanation must contain one or two sentences")
-
-    display_name = str(contractor.get("anon_name", "")).strip()
-    if not display_name or not explanation.startswith(display_name):
-        raise ExplanationValidationError("Explanation must start with anon_name")
+    if not all(isinstance(field, str) for field in structured_evidence):
+        raise ExplanationValidationError("Structured evidence fields must be strings")
+    if len(structured_evidence) != len(set(structured_evidence)):
+        raise ExplanationValidationError("Structured evidence fields must be unique")
 
     description = str(contractor.get("description", ""))
     if description_evidence not in description:
         raise ExplanationValidationError("Description evidence is not an exact source excerpt")
-    if description_evidence.casefold() not in explanation.casefold():
-        raise ExplanationValidationError("Explanation does not contain its description evidence")
-
-    lowered = explanation.casefold()
-    if any(phrase in lowered for phrase in GENERIC_PHRASES):
-        raise ExplanationValidationError("Generic praise is not allowed")
-    if "доступ" in lowered or "свобод" in lowered or query.get("event_date", "") in explanation:
-        raise ExplanationValidationError("The explanation must not infer availability")
-    if any(marker in lowered for marker in ("kzt", "₸", "тенге")) and not (
-        "старт" in lowered or re.search(r"(?:^|\s)от(?:\s|$)", lowered)
-    ):
-        raise ExplanationValidationError("Price must be described as a starting price")
 
     allowed_fields = set(OUTPUT_SCHEMA["properties"]["structured_evidence"]["items"]["enum"])
     if any(field not in allowed_fields for field in structured_evidence):
         raise ExplanationValidationError("Unknown structured evidence field")
     for field in structured_evidence:
-        if not _structured_field_is_mentioned(field, explanation, contractor, query):
+        if not _structured_field_is_verified(field, contractor, query):
             raise ExplanationValidationError(f"Structured field {field!r} is not grounded")
 
+    ordered_evidence = [
+        field for field in STRUCTURED_FIELD_ORDER if field in structured_evidence
+    ]
+    explanation = _build_explanation(
+        contractor, query, ordered_evidence, description_evidence
+    )
+    if len(explanation) > 600 or not 1 <= _sentence_count(explanation) <= 2:
+        raise ExplanationValidationError("Generated explanation must contain one or two sentences")
+
     return {
-        "explanation": explanation.strip(),
-        "description_evidence": description_evidence.strip(),
-        "structured_evidence": list(structured_evidence),
+        "explanation": explanation,
+        "description_evidence": description_evidence,
+        "structured_evidence": ordered_evidence,
     }
 
 
 def fallback_explanation(contractor, query):
     """Build a deterministic grounded explanation without an API call."""
-    name = str(contractor.get("anon_name", "Подрядчик"))
-    price = int(contractor["price_from_kzt"])
     excerpt = _description_excerpt(str(contractor.get("description", "")))
-    explanation = (
-        f"{name}: формат «{query['event_format']}», стартовая цена — от "
-        f"{price:,} KZT. В описании указано: «{excerpt}»."
+    explanation = _build_explanation(
+        contractor, query, ["event_format", "price_from_kzt"], excerpt
     )
     return {
         "explanation": explanation,
@@ -249,36 +226,93 @@ def fallback_explanation(contractor, query):
     }
 
 
-def _structured_field_is_mentioned(field, explanation, contractor, query):
-    lowered = explanation.casefold()
+def _structured_field_is_verified(field, contractor, query):
     if field == "category":
-        return str(query.get("category", "")).casefold() in lowered
+        return _contains_token(contractor.get("categories"), query.get("category"))
     if field == "city":
-        return str(query.get("city", "")).casefold() in lowered
+        return _same_text(contractor.get("city"), query.get("city"))
     if field == "event_format":
-        return str(query.get("event_format", "")).casefold() in lowered
+        return _contains_token(contractor.get("event_formats"), query.get("event_format"))
     if field == "language":
-        language = query.get("language")
-        return bool(language) and str(language).casefold() in lowered
+        return bool(query.get("language")) and _contains_token(
+            contractor.get("languages"), query.get("language")
+        )
     if field == "max_hours":
-        hours = contractor.get("max_hours")
-        return hours not in (None, "") and str(hours) in explanation
+        try:
+            return float(contractor["max_hours"]) >= float(query["duration_hours"])
+        except (KeyError, TypeError, ValueError):
+            return False
     if field == "price_from_kzt":
-        price = str(int(contractor["price_from_kzt"]))
-        return price in re.sub(r"\D", "", explanation)
+        try:
+            return int(contractor["price_from_kzt"]) <= int(query["budget_kzt"])
+        except (KeyError, TypeError, ValueError):
+            return False
     return False
 
 
+def _build_explanation(contractor, query, structured_evidence, description_evidence):
+    facts = []
+    for field in structured_evidence:
+        if field == "category":
+            facts.append(f"категория «{query['category']}»")
+        elif field == "city":
+            facts.append(f"город — {query['city']}")
+        elif field == "event_format":
+            facts.append(f"подходит для формата «{query['event_format']}»")
+        elif field == "price_from_kzt":
+            price = f"{int(contractor['price_from_kzt']):,}".replace(",", " ")
+            facts.append(f"стартовая цена — от {price} KZT")
+        elif field == "language":
+            facts.append(f"заявлен язык «{query['language']}»")
+        elif field == "max_hours":
+            facts.append(
+                f"лимит {contractor['max_hours']} ч покрывает запрос "
+                f"на {query['duration_hours']} ч"
+            )
+
+    name = str(contractor.get("anon_name", "Подрядчик")).strip() or "Подрядчик"
+    explanation = f"{name}: {'; '.join(facts)}."
+    if description_evidence:
+        explanation += f" В описании указано: «{description_evidence}»."
+    return explanation
+
+
+def _contains_token(value, expected):
+    expected_text = str(expected or "").strip().casefold()
+    return bool(expected_text) and expected_text in {
+        token.strip().casefold() for token in str(value or "").split("|")
+    }
+
+
+def _same_text(left, right):
+    return bool(str(right or "").strip()) and str(left or "").strip().casefold() == str(
+        right
+    ).strip().casefold()
+
+
 def _description_excerpt(description):
-    candidates = [part.strip(" \n\t.!?") for part in re.split(r"[.!?]+", description)]
-    candidates = [part for part in candidates if len(part.split()) >= 4]
-    for candidate in candidates:
+    candidates = [
+        match.group().strip().rstrip(".!?")
+        for match in re.finditer(r"[^.!?]+(?:[.!?]+|$)", description)
+    ]
+    candidates = [part for part in candidates if part]
+    preferred = [part for part in candidates if len(part.split()) >= 4]
+    for candidate in preferred:
         intro = candidate.casefold()
         if not intro.startswith(("я ", "я,", "меня зовут", "привет")) and " — " not in candidate[:60]:
-            return " ".join(candidate.split()[:24])
+            return _exact_word_prefix(candidate, 24)
+    if preferred:
+        return _exact_word_prefix(preferred[0], 24)
     if candidates:
-        return " ".join(candidates[0].split()[:24])
-    return "Описание подтверждает заявленный формат работы"
+        return _exact_word_prefix(candidates[0], 24)
+    return ""
+
+
+def _exact_word_prefix(text, word_limit):
+    words = list(re.finditer(r"\S+", text))
+    if len(words) <= word_limit:
+        return text
+    return text[: words[word_limit - 1].end()]
 
 
 def _sentence_count(text):

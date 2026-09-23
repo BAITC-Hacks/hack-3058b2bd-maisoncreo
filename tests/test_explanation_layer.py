@@ -5,6 +5,7 @@ from unittest.mock import patch
 from explanation_layer import (
     ExplanationValidationError,
     enrich_recommendations,
+    fallback_explanation,
     validate_explanation,
 )
 
@@ -47,10 +48,6 @@ def result(*ids):
 
 def valid_model_output(contractor_id="c1"):
     return {
-        "explanation": (
-            f"Исполнитель {contractor_id}: проводит корпоративы на языке «русский». "
-            "В описании указано: «Работает с деловой аудиторией»."
-        ),
         "description_evidence": "Работает с деловой аудиторией",
         "structured_evidence": ["event_format", "language"],
     }
@@ -68,6 +65,8 @@ class ExplanationLayerTests(unittest.TestCase):
             card["explanation_evidence"]["description_excerpt"],
             "Работает с деловой аудиторией",
         )
+        self.assertIn("формата «корпоратив»", card["explanation"])
+        self.assertIn("язык «русский»", card["explanation"])
 
     def test_unsupported_description_evidence_uses_fallback(self):
         output = valid_model_output()
@@ -89,20 +88,16 @@ class ExplanationLayerTests(unittest.TestCase):
         ):
             validate_explanation(output, contractor(), QUERY)
 
-    def test_generic_or_unqualified_price_claim_uses_fallback(self):
+    def test_model_authored_fabricated_claim_never_reaches_explanation(self):
         output = valid_model_output()
-        output["explanation"] = (
-            "Исполнитель c1 — отличный выбор за 200000 KZT. "
-            "В описании указано: «Работает с деловой аудиторией»."
-        )
-        output["structured_evidence"] = ["price_from_kzt"]
+        output["explanation"] = "Исполнитель c1 имеет рейтинг 5.0."
 
         enriched = enrich_recommendations(
             result("c1"), [contractor()], QUERY, provider=lambda *_: output
         )
 
         self.assertEqual(enriched["recommendations"][0]["explanation_source"], "fallback")
-        self.assertIn("стартовая цена — от", enriched["recommendations"][0]["explanation"])
+        self.assertNotIn("рейтинг 5.0", enriched["recommendations"][0]["explanation"])
 
     def test_provider_failure_uses_fallback(self):
         def failing_provider(*_):
@@ -116,6 +111,24 @@ class ExplanationLayerTests(unittest.TestCase):
         evidence = enriched["recommendations"][0]["explanation_evidence"]["description_excerpt"]
         self.assertIn(evidence, enriched["recommendations"][0]["explanation"])
 
+    def test_provider_failure_prevents_subsequent_provider_calls(self):
+        calls = []
+
+        def failing_provider(contractor_record, _):
+            calls.append(contractor_record["id"])
+            raise TimeoutError("API unavailable")
+
+        records = [contractor("c1"), contractor("c2"), contractor("c3")]
+        enriched = enrich_recommendations(
+            result("c1", "c2", "c3"), records, QUERY, provider=failing_provider
+        )
+
+        self.assertEqual(calls, ["c1"])
+        self.assertEqual(
+            [card["explanation_source"] for card in enriched["recommendations"]],
+            ["fallback", "fallback", "fallback"],
+        )
+
     def test_no_api_key_uses_fallback_without_api_call(self):
         with patch.dict(os.environ, {}, clear=True):
             enriched = enrich_recommendations(result("c1"), [contractor()], QUERY)
@@ -125,38 +138,44 @@ class ExplanationLayerTests(unittest.TestCase):
     def test_enrichment_never_changes_selection_or_order(self):
         records = [contractor("c1"), contractor("c2"), contractor("c3")]
 
-        enriched = enrich_recommendations(result("c3", "c1", "c2"), records, QUERY)
+        enriched = enrich_recommendations(
+            result("c3", "c1", "c2"),
+            records,
+            QUERY,
+            provider=lambda contractor_record, _: valid_model_output(contractor_record["id"]),
+        )
 
         self.assertEqual(
             [card["id"] for card in enriched["recommendations"]],
             ["c3", "c1", "c2"],
         )
 
-    def test_validator_rejects_availability_claim(self):
+    def test_validator_rejects_unsupported_structured_evidence(self):
         output = valid_model_output()
-        output["explanation"] = (
-            "Исполнитель c1 доступен на выбранную дату и проводит корпоративы. "
-            "В описании указано: «Работает с деловой аудиторией»."
-        )
-        output["structured_evidence"] = ["event_format"]
+        output["structured_evidence"] = ["max_hours"]
+        query = dict(QUERY, duration_hours=7)
 
-        with self.assertRaises(ValueError):
-            validate_explanation(output, contractor(), QUERY)
+        with self.assertRaisesRegex(ExplanationValidationError, "is not grounded"):
+            validate_explanation(output, contractor(), query)
 
-    def test_description_name_cannot_replace_anonymous_name(self):
-        output = valid_model_output()
-        output["explanation"] = (
-            "Другое имя проводит корпоративы на языке «русский». "
-            "В описании указано: «Работает с деловой аудиторией»."
-        )
+    def test_empty_description_fallback_is_structured_only(self):
+        record = contractor()
+        record["description"] = ""
 
-        enriched = enrich_recommendations(
-            result("c1"), [contractor()], QUERY, provider=lambda *_: output
-        )
+        generated = fallback_explanation(record, QUERY)
 
-        card = enriched["recommendations"][0]
-        self.assertEqual(card["explanation_source"], "fallback")
-        self.assertTrue(card["explanation"].startswith("Исполнитель c1"))
+        self.assertEqual(generated["description_evidence"], "")
+        self.assertNotIn("В описании", generated["explanation"])
+        self.assertIn("формата «корпоратив»", generated["explanation"])
+
+    def test_fallback_description_evidence_is_an_exact_source_substring(self):
+        record = contractor()
+        record["description"] = "  Коротко.  Точный   текст с исходными пробелами!  "
+
+        generated = fallback_explanation(record, QUERY)
+
+        self.assertTrue(generated["description_evidence"])
+        self.assertIn(generated["description_evidence"], record["description"])
 
 
 if __name__ == "__main__":
