@@ -49,6 +49,11 @@ PRESETS = {
         "language": "русский",
     },
 }
+PRESET_LABELS = {
+    "DENSE": "Много вариантов",
+    "RARE": "Мало вариантов",
+    "NO RESULT": "Нет подходящих",
+}
 
 
 @st.cache_data
@@ -136,9 +141,9 @@ def render_card(card, record, query):
             st.caption("Данные: " + " · ".join(indicators))
 
         source_label = (
-            "OpenAI explanation"
+            "Объяснение с помощью OpenAI"
             if card.get("explanation_source") == "openai"
-            else "проверенное резервное объяснение"
+            else "Проверенное резервное объяснение"
         )
         st.caption(f"Источник объяснения: {source_label}")
         evidence = card.get("explanation_evidence", {})
@@ -191,14 +196,14 @@ def main():
     horizon_start = date.fromisoformat(horizon["start"])
     horizon_end = date.fromisoformat(horizon["end"])
 
-    st.title("Smart Contractor Selection")
+    st.title("Умный подбор подрядчиков")
     st.write("До трёх проверенных рекомендаций по вашим условиям — без бронирования.")
 
     st.caption("Демо-запросы")
     preset_columns = st.columns(3)
     for column, preset_name in zip(preset_columns, PRESETS):
         column.button(
-            preset_name,
+            PRESET_LABELS[preset_name],
             use_container_width=True,
             on_click=apply_preset,
             args=(preset_name,),
