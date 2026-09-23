@@ -1,6 +1,13 @@
 # hack-3058b2bd-maisoncreo
 Hackathon team repository for Maisoncreo
 
+## Run the demo
+
+```bash
+python3 -m pip install -r requirements.txt
+streamlit run app.py
+```
+
 ## Optional live explanations
 
 The optional OpenAI explanation layer validates every declared structured fact
